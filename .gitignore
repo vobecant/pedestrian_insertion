@@ -1,4 +1,6 @@
 debug*
+imgs/
+datasets/
 checkpoints/
 results/
 build/
