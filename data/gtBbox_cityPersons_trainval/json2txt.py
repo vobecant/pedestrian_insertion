@@ -73,6 +73,6 @@ def normalize_and_center_bb(bb, im_h, im_w):
 
 
 if __name__ == '__main__':
-    folder = 'gtBboxCityPersons'
-    save_dir = 'C:/Users/Antonin-PC/school/PhD/projects/pix2pixHD/data/yolo_bbs_orig'
+    folder = '/opt/datasets/cityscapes/gtBboxCityPersons'
+    save_dir = '/home/tonda/projects/pedestrian_insertion/data/gtBbox_cityPersons_trainval'
     process_folder(folder, save_dir)
