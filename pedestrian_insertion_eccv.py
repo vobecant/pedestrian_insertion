@@ -1,5 +1,7 @@
 import os
 from collections import OrderedDict
+
+import cv2
 from torch.autograd import Variable
 from options.test_options import TestOptions
 from data.data_loader import CreateDataLoader
@@ -14,7 +16,13 @@ from shutil import copyfile
 from PIL import Image
 import pickle
 from data.base_dataset import get_transform, get_params
-import matplotlib.pyplot as plt
+
+# import matplotlib.pyplot as plt
+
+CROPS_DIR = '/home/vobecant/datasets/DummyGAN_cityscapes_noFine/1P/crops'
+MASKS_DIR = '/home/vobecant/datasets/cityscapes/GAN_crops/train'
+CS_TRAIN_DIR = '/home/vobecant/datasets/cityscapes/leftImg8bit/train'
+SAVE_DIR = '/home/vobecant/datasets/cityscapes/eccv2020/pix2pix'
 
 
 def insert_generated(original, generated, to_insert):
@@ -160,6 +168,92 @@ def fit_to_image(x, y, side, im_w, im_h):
     return x, y, side
 
 
+class Loader_ECCV:
+    def __init__(self, crops_dir, masks_dir, cityscapes_train_dir, im_w=2048, im_h=1024):
+        self.im_w, self.im_h = im_w, im_h
+        self.image_dir = cityscapes_train_dir
+        self.masks = []
+        self.mask_id = 0
+        for fname in os.listdir(masks_dir):
+            with open(os.path.join(masks_dir, fname), 'rb') as f:
+                mask = pickle.load(f)['mask_orig']
+                self.masks.append(mask)
+        self.crop_params = []
+        self.crop_params_id = 0
+        for city in os.listdir(crops_dir):
+            city_dir = os.path.join(crops_dir, city)
+            for fname in os.listdir(city_dir):
+                if not '.txt' in fname:
+                    continue
+                with open(os.path.join(city_dir, fname), 'r') as f:
+                    img_name = os.path.join(city, '_'.join(fname.split('_')[:3]) + '_leftImg8bit.png')
+                    crop_par = f.readline()
+                    crop_par = [int(i) for i in crop_par.split(' ')]
+                    self.crop_params.append((img_name, crop_par))
+        self.opt = opt
+        self.pedestrian_id = 24
+
+    def normalize(self):
+        return transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+
+    def insert_pedestrians(self, original_labels, pedestrian_pixels):
+        modified_labels = np.array(original_labels)
+        modified_labels[np.where(pedestrian_pixels[:, :, 0])] = self.pedestrian_id
+        modified_labels = Image.fromarray(modified_labels)
+        return modified_labels
+
+    def insert_pedestrian(self, original_labels_map, pedestrian_positions, crop_parameters):
+        left, top, right, bottom = crop_parameters
+        labels_crop = original_labels_map[top:bottom, left:right]
+        labels_crop[pedestrian_positions] = self.pedestrian_id
+        original_labels_map[top:bottom, left:right] = labels_crop
+        pil_labels = Image.fromarray(original_labels_map)
+        return pil_labels
+
+    def __len__(self):
+        return len(self.crop_params)
+
+    def __getitem__(self, index):
+        img_name, crop_params = self.crop_params[index]
+        img_path = os.path.join(self.image_dir, img_name)
+        image = np.array(Image.open(img_path).convert('RGB'))
+        data = {}
+        data['image'] = None
+        data['image_orig'] = image
+        labels_path = img_path.replace('/leftImg8bit/', '/gtFine/').replace('_leftImg8bit.png', '_gtFine_labelIds.png')
+        labels_orig = cv2.imread(labels_path)
+
+        # insert pedestrian into label map
+        left, top, right, bottom = self.crop_params[self.crop_params_id]
+        self.crop_params_id = (self.crop_params_id + 1) % len(self.crop_params)
+        width, height = left - right, top - bottom
+        assert width == height
+        mask = self.masks[self.mask_id]
+        self.mask_id = (self.mask_id + 1) % len(self.masks)
+        mask = cv2.resize(mask.numpy(), width, interpolation=cv2.INTER_LINEAR)
+        mask = mask > 0.95
+        labels = self.insert_pedestrian(labels_orig, mask, (left, top, right, bottom))
+
+        # transform labels
+        params = get_params(self.opt, labels.size)
+        if self.opt.label_nc == 0:
+            transform = get_transform(self.opt, params)
+            data['label'] = transform(labels.convert('RGB'))
+        else:
+            transform = get_transform(self.opt, params, method=Image.NEAREST, normalize=False)
+            data['label'] = transform(labels) * 255.0
+            # labels_orig = transform(labels_orig) * 255.0
+        data['label'] = data['label'].unsqueeze(0)
+
+        # load and resize instances
+        inst = Image.open(data['new_instances']).resize((self.im_w, self.im_h), Image.NEAREST)
+
+        # transform instances
+        data['inst'] = torch.zeros_like(labels_orig).unsqueeze(0)
+
+        return data
+
+
 class Loader:
     def __init__(self, opt, path, split, im_w=2048, im_h=1024, new_base=None):
         self.new_base = new_base
@@ -248,7 +342,7 @@ if __name__ == '__main__':
     # proposed_bbs = './data/proposed_bbs_ep{}.pkl'.format(bbs_epoch)
     proposed_bbs = '/home/vobecant/diploma_thesis/pedestrian_inpainting/data/proposed_bbs_ep117.pkl'
     # save_path_extended_base = '/mnt/nas/data/CVPR2020/pix2pixHD_CS/'
-    save_path_extended_base = '/home/vobecant/datasets/cityscapes/'
+    save_path_extended_base = SAVE_DIR
     save_path_extended_bb = os.path.join(save_path_extended_base, 'cityscapes_bbs_extended')
     save_path_extended_img = os.path.join(save_path_extended_base, 'cityscapes_imgs_extended')
     save_path_cropped_img = os.path.join(save_path_extended_base, 'cityscapes_imgs_cropped')
@@ -292,86 +386,84 @@ if __name__ == '__main__':
     else:
         from run_engine import run_trt_engine, run_onnx
 
-    for split in splits:
+    # dataset = Loader(opt, proposed_bbs, split, new_base=new_base)
+    dataset = Loader_ECCV(CROPS_DIR, MASKS_DIR, CS_TRAIN_DIR)
+    save_path_cropped_img_split = SAVE_DIR
+    if not os.path.exists(save_path_cropped_img_split):
+        os.makedirs(save_path_cropped_img_split)
+    counter = 0
 
-        dataset = Loader(opt, proposed_bbs, split, new_base=new_base)
-        save_path_cropped_img_split = os.path.join(save_path_cropped_img, split)
-        if not os.path.exists(save_path_cropped_img_split):
-            os.makedirs(save_path_cropped_img_split)
-        counter = 0
+    for i, data in enumerate(dataset):
 
-        for i, data in enumerate(dataset):
+        if opt.data_type == 16:
+            data['label'] = data['label'].half()
+            data['inst'] = data['inst'].half()
+        elif opt.data_type == 8:
+            data['label'] = data['label'].uint8()
+            data['inst'] = data['inst'].uint8()
+        if opt.export_onnx:
+            print("Exporting to ONNX: ", opt.export_onnx)
+            assert opt.export_onnx.endswith("onnx"), "Export model file should end with .onnx"
+            torch.onnx.export(model, [data['label'], data['inst']],
+                              opt.export_onnx, verbose=True)
+            exit(0)
 
-            if opt.data_type == 16:
-                data['label'] = data['label'].half()
-                data['inst'] = data['inst'].half()
-            elif opt.data_type == 8:
-                data['label'] = data['label'].uint8()
-                data['inst'] = data['inst'].uint8()
-            if opt.export_onnx:
-                print("Exporting to ONNX: ", opt.export_onnx)
-                assert opt.export_onnx.endswith("onnx"), "Export model file should end with .onnx"
-                torch.onnx.export(model, [data['label'], data['inst']],
-                                  opt.export_onnx, verbose=True)
-                exit(0)
+        # data['label'] = data['label'].to(device)
+        # data['inst'] = data['inst'].to(device)
+        # if data['image'] is not None:
+        #    data['image'] = data['image'].to(device)
 
-            # data['label'] = data['label'].to(device)
-            # data['inst'] = data['inst'].to(device)
-            # if data['image'] is not None:
-            #    data['image'] = data['image'].to(device)
+        minibatch = 1
+        if opt.engine:
+            generated = run_trt_engine(opt.engine, minibatch, [data['label'], data['inst']])
+        elif opt.onnx:
+            generated = run_onnx(opt.onnx, opt.data_type, minibatch, [data['label'], data['inst']])
+        else:
+            generated = model.inference(data['label'], data['inst'], data['image'])
 
-            minibatch = 1
-            if opt.engine:
-                generated = run_trt_engine(opt.engine, minibatch, [data['label'], data['inst']])
-            elif opt.onnx:
-                generated = run_onnx(opt.onnx, opt.data_type, minibatch, [data['label'], data['inst']])
-            else:
-                generated = model.inference(data['label'], data['inst'], data['image'])
+        visuals = OrderedDict([('input_label', util.tensor2label(data['label'][0], opt.label_nc)),
+                               ('synthesized_image', util.tensor2im(generated.data[0]))])
 
-            visuals = OrderedDict([('input_label', util.tensor2label(data['label'][0], opt.label_nc)),
-                                   ('synthesized_image', util.tensor2im(generated.data[0]))])
+        img_path = data['img']
 
-            img_path = data['img']
+        merged = None
+        base_dir, img_name = os.path.split(img_path)
+        split, city = base_dir.split(os.sep)[-2:]
+        fdir = os.path.join(save_path_extended_img, split, city)
+        if insert2orig:
+            # merge the original image with the generated one
+            original_image = data['image_orig']
+            generated_image = visuals['synthesized_image']
+            labels = visuals['input_label']
+            inserted_instances = data['to_insert']
+            assert (inserted_instances.shape == original_image.shape) and (
+                inserted_instances.shape == generated_image.shape), "Shapes do not match! Proposed solution: upsample the conditional input with NEAREST NEIGHBOR."
+            merged = insert_generated(original_image, generated_image, inserted_instances)
+            # and save it
+            if not os.path.exists(fdir):
+                os.makedirs(fdir)
+            fname = os.path.join(fdir, img_name)
+            merged.save(fname)
 
-            merged = None
-            base_dir, img_name = os.path.split(img_path)
-            split, city = base_dir.split(os.sep)[-2:]
-            fdir = os.path.join(save_path_extended_img, split, city)
-            if insert2orig:
-                # merge the original image with the generated one
-                original_image = data['image_orig']
-                generated_image = visuals['synthesized_image']
-                labels = visuals['input_label']
-                inserted_instances = data['to_insert']
-                assert (inserted_instances.shape == original_image.shape) and (
-                    inserted_instances.shape == generated_image.shape), "Shapes do not match! Proposed solution: upsample the conditional input with NEAREST NEIGHBOR."
-                merged = insert_generated(original_image, generated_image, inserted_instances)
-                # and save it
-                if not os.path.exists(fdir):
-                    os.makedirs(fdir)
-                fname = os.path.join(fdir, img_name)
-                merged.save(fname)
+        if merged is None:
+            merged = Image.fromarray(visuals['synthesized_image'])
 
-            if merged is None:
-                merged = Image.fromarray(visuals['synthesized_image'])
+        # continue
+        # append new bounding boxes
+        new_bbs = data['bbs_centered']
+        img_name_noext = img_name.split('.')[0]
+        orig_bbs_file = os.path.join(orig_path_bb, split, city, '{}.txt'.format(img_name_noext))
+        new_file = os.path.join(save_path_extended_bb, split, city, '{}_extended.txt'.format(img_name_noext))
+        extend_bbs(orig_bbs_file, new_bbs, new_file)
 
-            # continue
-            # append new bounding boxes
-            new_bbs = data['bbs_centered']
-            img_name_noext = img_name.split('.')[0]
-            orig_bbs_file = os.path.join(orig_path_bb, split, city, '{}.txt'.format(img_name_noext))
-            new_file = os.path.join(save_path_extended_bb, split, city, '{}_extended.txt'.format(img_name_noext))
-            extend_bbs(orig_bbs_file, new_bbs, new_file)
+        # crop generated images centered at the generated pedestrian
+        new_obj_mask = data['to_insert']
+        instances = data['inst']
+        counter = crop_and_save(merged, instances, new_bbs, crop_size, counter,
+                                save_path_cropped_img_split)
 
-            # crop generated images centered at the generated pedestrian
-            new_obj_mask = data['to_insert']
-            instances = data['inst']
-            counter = crop_and_save(merged, instances, new_bbs, crop_size, counter,
-                                    save_path_cropped_img_split)
+        if (i + 1) % 100 == 0:
+            print('Split: {}, {}/{} completed'.format(split, i + 1, len(dataset)))
 
-            if (i + 1) % 100 == 0:
-                print('Split: {}, {}/{} completed'.format(split, i + 1, len(dataset)))
 
-        print('Split "{}" finished.\n\n'.format(split))
-
-        # webpage.save()
+            # webpage.save()
